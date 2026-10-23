@@ -58,4 +58,10 @@ install(DIRECTORY launch
   DESTINATION share/${PROJECT_NAME}
 )
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_ins_heading test/test_ins_heading.cpp)
+  target_include_directories(test_ins_heading PRIVATE include)
+endif()
+
 ament_package()

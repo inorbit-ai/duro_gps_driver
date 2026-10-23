@@ -38,12 +38,14 @@
 // include folder headers
 #include "duro_gps_driver/UTM.h"
 #include "duro_gps_driver/fake_orientation.hpp"
+#include "duro_gps_driver/ins_heading.hpp"
 
 rclcpp::Node::SharedPtr node;
 // Publishers
 rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr navsatfix_pub;
 rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub;
 rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub;
+rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr ins_pub;
 rclcpp::Publisher<sensor_msgs::msg::MagneticField>::SharedPtr mag_pub;
 rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr euler_pub;
 rclcpp::Publisher<geometry_msgs::msg::Vector3>::SharedPtr euler_pub_fake;
@@ -90,6 +92,9 @@ bool publish_fake_orientation;
 bool publish_imu_messages;
 bool publish_odom_messages;
 bool publish_tf;
+bool publish_ins;
+std::string ins_frame;
+double max_yaw_accuracy_deg;
 float x_coord_offset, y_coord_offset;
 float z_coord_exact_height;
 
@@ -116,6 +121,10 @@ bool first_run_z_coord = true;
 bool first_run_position = true;
 bool first_run_tf_static = true;
 bool first_run_orientation = true;
+// the latest ORIENT_EULER heading: none until the first one, so imu reports its orientation unknown
+duro_gps_driver::InsHeading ins_latest = {0.0, 0.0f, false};
+bool ins_usable = false;
+int ins_usable_logged = -1;  // ins_usable when last logged (-1: never), to log only its changes
 double z_coord_start = 0.0;
 geometry_msgs::msg::PoseStamped start_pose;
 
@@ -495,6 +504,43 @@ void orientation_euler_callback(u16 sender_id, u8 len, u8 msg[], void *context)
   if(publish_fake_orientation){
     euler_pub_fake->publish(euler_fake_vector_msg);
   }
+
+  // The INS heading on `ins`, only while the INS reports it valid within max_yaw_accuracy_deg. While it
+  // aligns, ORIENT_EULER carries yaw 0 with mode 0, which the orientation below turns into +90 deg.
+  ins_latest = duro_gps_driver::ins_heading(orimsg->yaw, orimsg->yaw_accuracy, orimsg->flags);
+  ins_usable = duro_gps_driver::usable(ins_latest, max_yaw_accuracy_deg);
+  if (int(ins_usable) != ins_usable_logged)
+  {
+    if (ins_usable)
+    {
+      RCLCPP_INFO(node->get_logger(), "INS heading valid (yaw accuracy %.1f deg): publishing ins",
+                  ins_latest.accuracy_deg);
+    }
+    else
+    {
+      RCLCPP_WARN(node->get_logger(), "INS heading not usable (aligning, or accuracy above %.1f deg): "
+                  "drive forward in a straight line with a GNSS fix to align it", max_yaw_accuracy_deg);
+    }
+    ins_usable_logged = int(ins_usable);
+  }
+  if (publish_ins && ins_usable)
+  {
+    sensor_msgs::msg::Imu ins_msg;
+    // stamped on receipt: ORIENT_EULER arrives about 30 ms after its epoch
+    ins_msg.header.stamp = node->now();
+    ins_msg.header.frame_id = ins_frame;
+    tf2::Quaternion q;
+    q.setRPY(0.0, 0.0, ins_latest.yaw_enu);
+    ins_msg.orientation.x = q.getX();
+    ins_msg.orientation.y = q.getY();
+    ins_msg.orientation.z = q.getZ();
+    ins_msg.orientation.w = q.getW();
+    // yaw only: roll and pitch are given a large variance, angular velocity and acceleration are not provided
+    ins_msg.orientation_covariance = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, duro_gps_driver::yaw_variance(ins_latest)};
+    ins_msg.angular_velocity_covariance[0] = -1.0;
+    ins_msg.linear_acceleration_covariance[0] = -1.0;
+    ins_pub->publish(ins_msg);
+  }
   if (euler_based_orientation)
   {
     tf2::Quaternion fromeuler;
@@ -533,6 +579,17 @@ void imu_callback(u16 sender_id, u8 len, u8 msg[], void *context)
     imu_msg.orientation.x = pose_msg.pose.orientation.x;
     imu_msg.orientation.y = pose_msg.pose.orientation.y;
     imu_msg.orientation.z = pose_msg.pose.orientation.z;
+    // REP 145: orientation_covariance[0] = -1 means no orientation estimate. Without a usable INS heading the
+    // orientation above is a placeholder (+90 deg while the INS aligns), so say so instead of a zero covariance.
+    imu_msg.orientation_covariance = {};
+    if (ins_usable)
+    {
+      imu_msg.orientation_covariance[8] = duro_gps_driver::yaw_variance(ins_latest);
+    }
+    else
+    {
+      imu_msg.orientation_covariance[0] = -1.0;
+    }
     if(publish_imu_messages){
       imu_pub->publish(imu_msg);
     }
@@ -655,6 +712,9 @@ int main(int argc, char * argv[])
   node->declare_parameter<bool>("publish_imu_messages", true);
   node->declare_parameter<bool>("publish_odom_messages", true);
   node->declare_parameter<bool>("publish_tf", true);
+  node->declare_parameter<bool>("publish_ins", true);
+  node->declare_parameter<std::string>("ins_frame", "base_link");  // the Duro's x axis points forward
+  node->declare_parameter<double>("max_yaw_accuracy_deg", 5.0);
   
 
   node->get_parameter("ip_address", tcp_ip_addr);
@@ -676,6 +736,9 @@ int main(int argc, char * argv[])
   node->get_parameter("publish_imu_messages", publish_imu_messages);
   node->get_parameter("publish_odom_messages", publish_odom_messages);
   node->get_parameter("publish_tf", publish_tf);
+  node->get_parameter("publish_ins", publish_ins);
+  node->get_parameter("ins_frame", ins_frame);
+  node->get_parameter("max_yaw_accuracy_deg", max_yaw_accuracy_deg);
 
   navsatfix_pub = node->create_publisher<sensor_msgs::msg::NavSatFix>("navsatfix", 100);
   if(publish_odom_messages){
@@ -683,6 +746,9 @@ int main(int argc, char * argv[])
   }
   if(publish_imu_messages){
     imu_pub = node->create_publisher<sensor_msgs::msg::Imu>("imu", 100);
+  }
+  if(publish_ins){
+    ins_pub = node->create_publisher<sensor_msgs::msg::Imu>("ins", 10);
   }
   mag_pub = node->create_publisher<sensor_msgs::msg::MagneticField>("mag", 100);
   euler_pub = node->create_publisher<geometry_msgs::msg::Vector3>("rollpitchyaw", 100);
